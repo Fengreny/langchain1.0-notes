@@ -1,0 +1,187 @@
+在早期的 LangChain 开发中，我们要么使用简单的 `LLMChain`，要么构建复杂的 DAG（有向无环图）。但在真实的业务场景——特别是**智能客服**中，流程往往不是线性的：
+
+*   用户的问题可能需要查文档（RAG），也可能需要查订单（SQL）。
+*   模型可能一次查不到结果，需要换个关键词重试。
+*   模型需要根据工具返回的结果（Observation）决定下一步行动。
+
+这种**循环（Loop）**和**决策（Reasoning）**的能力，正是 **Agent** 的核心。
+
+---
+
+## 1. 核心架构：基于 LangGraph 的运行时
+
+LangChain 的 `create_agent` 并不是简单的封装，它在底层构建了一个基于 **[LangGraph](https://langchain-ai.github.io/langgraph/)** 的图结构。
+
+### 1.1 传统的 Chain vs. 现在的 Agent
+
+*   **Chain**: 线性执行 (`Step A -> Step B -> Output`)。
+*   **Agent**: 循环执行 (`Model -> Tools -> Observation -> Model ...`)。
+
+这个循环会一直运行，直到满足**停止条件**（Stop Condition），例如模型生成了最终答案，或者达到了最大迭代次数。
+
+### 1.2 代码解析
+
+```python
+from langchain.agents import create_agent
+# 注意：LangGraph 是 Agent 运行时的基石，提供了状态管理和循环能力
+```
+
+在智能客服场景中，这意味着 Agent 可以“多想一步”。如果检索到的文档与用户问题不匹配，Agent 可以选择不回答，而是调用搜索工具重新检索，而不是直接产生幻觉。
+
+---
+
+## 2. 模型层（Model）：静态配置与动态路由
+
+Agent 的大脑是 LLM。在生产环境中，我们不仅要关注模型的效果，还要关注**成本**和**延迟**。
+
+### 2.1 静态模型配置 (Static Configuration)
+
+这是最基础的用法，但在代码细节上有很多讲究：
+
+```python
+from langchain_openai import ChatOpenAI 
+# 知识点：langchain_openai 是独立包，与 langchain-core 解耦，
+# 这样 OpenAI API 更新时，核心库不需要变动。
+
+model = ChatOpenAI(
+    model="gpt-4o",
+    # RAG 关键参数：
+    temperature=0.1,  # 低温度降低随机性，减少客服场景下的“胡说八道”
+    max_tokens=1000,  # 限制输出长度，防止模型生成长篇大论消耗 Token
+    timeout=30        # 生产环境必须设置超时，防止请求挂死
+)
+```
+
+### 2.2 动态模型路由 (Dynamic Model Selection)
+
+**这是高阶技巧。** 在客服系统中，并非所有问题都需要昂贵的 GPT-4。我们可以使用 **Middleware (中间件)** 实现动态路由。
+
+**场景**：
+*   简单闲聊 -> `gpt-4o-mini` (低成本)
+*   复杂投诉/推理 -> `gpt-4o` (高智商)
+
+```python
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
+
+basic_model = ChatOpenAI(model="gpt-4o-mini")
+advanced_model = ChatOpenAI(model="gpt-4o")
+
+@wrap_model_call
+def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
+    """
+    中间件逻辑：在调用模型前拦截请求，根据上下文长度动态切换模型。
+    """
+    # 获取当前对话历史
+    message_count = len(request.state["messages"])
+
+    # 启发式规则：如果对话超过 10 轮，说明问题棘手，切换强力模型
+    if message_count > 10:
+        model = advanced_model
+    else:
+        model = basic_model
+
+    # 覆盖本次请求的模型配置
+    return handler(request.override(model=model))
+```
+
+**技术解读**：这里应用了 **AOP（面向切面编程）** 的思想。业务逻辑不需要感知模型的切换，中间件在运行时默默完成了优化。
+
+---
+
+## 3. 工具层（Tools）：ReAct 模式与容错
+
+Agent 的核心能力在于使用工具（Tools）。在 RAG 项目中，工具通常是 `Retriever`（检索器）的封装。
+
+### 3.1 ReAct 循环原理
+
+Agent 遵循 **ReAct (Reasoning + Acting)** 模式：
+1.  **User**: "我的订单发货了吗？"
+2.  **Model (Reasoning)**: "用户在问订单，我需要调用查询工具。"
+3.  **Tool (Acting)**: 调用 `check_order_status(user_id)`。
+4.  **Tool (Observation)**: 返回 "已发货，单号 123"。
+5.  **Model (Answer)**: "亲，您的订单已发货，单号是 123。"
+
+### 3.2 生产级错误处理 (Error Handling)
+
+**痛点**：外部 API（如数据库、向量库）经常会挂掉或超时。如果工具报错，程序不能崩，必须让 Agent 知道发生了什么。
+
+我们可以使用 `@wrap_tool_call` 中间件来捕获异常：
+
+```python
+from langchain.agents.middleware import wrap_tool_call
+from langchain.messages import ToolMessage
+
+@wrap_tool_call
+def handle_tool_errors(request, handler):
+    try:
+        return handler(request)
+    except Exception as e:
+        # 关键点：不要抛出异常，而是返回一条 ToolMessage 给模型
+        # 模型看到错误信息后，通常会尝试自我修正参数或礼貌回复用户
+        return ToolMessage(
+            content=f"系统工具暂时不可用，错误信息: {str(e)}",
+            tool_call_id=request.tool_call["id"]
+        )
+```
+
+---
+
+## 4. 状态管理与结构化输出
+
+### 4.1 状态管理 (State Management)
+
+Agent 需要记忆。除了对话历史，我们可能还需要存储用户的**情绪状态**或**会员等级**。
+
+**版本变更注意**：在 LangChain v1.0+ 中，自定义状态 Schema **必须**使用 `TypedDict`，不再支持 Pydantic。
+
+```python
+from langchain.agents import AgentState
+from typing import TypedDict
+
+class CustomerServiceState(AgentState):
+    user_id: str
+    sentiment_score: float  # 记录用户情绪，用于判断是否转人工
+
+# 在创建 Agent 时注入 Schema
+agent = create_agent(
+    model,
+    tools=tools,
+    state_schema=CustomerServiceState
+)
+```
+
+### 4.2 结构化输出 (Structured Output)
+
+客服 Agent 往往不仅需要回复文本，还需要输出结构化数据（如工单 JSON）。LangChain 提供了两种策略：
+
+1.  **`ProviderStrategy`**: 使用 OpenAI 等模型原生的 JSON Mode（推荐，更稳定）。
+2.  **`ToolStrategy`**: 利用 Tool Calling 机制模拟结构化输出（通用性强）。
+
+```python
+from pydantic import BaseModel
+from langchain.agents.structured_output import ProviderStrategy
+
+class TicketInfo(BaseModel):
+    issue_summary: str
+    priority: str
+
+agent = create_agent(
+    model="gpt-4o",
+    response_format=ProviderStrategy(TicketInfo) # 强制模型输出符合 TicketInfo 结构的数据
+)
+```
+
+---
+
+## 5. 总结
+
+从简单的 Chain 进化到基于 Graph 的 Agent，LangChain 为我们提供了构建复杂 AI 应用的脚手架。对于**智能客服 RAG 项目**，建议遵循以下最佳实践：
+
+1.  **架构**：利用 `create_agent` 的循环特性，处理复杂的追问场景。
+2.  **成本**：使用 Middleware 实现大小模型的动态切换。
+3.  **稳定**：必须为工具调用添加错误处理中间件。
+4.  **数据**：使用 `TypedDict` 管理用户上下文状态。
+
+---
+
+*Author: jintao | Tech Stack: Python, LangChain, LLM*
