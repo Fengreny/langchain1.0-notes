@@ -1,0 +1,321 @@
+## 核心组件 -agent
+
+# 静态调用模型：
+  from langchain.agents import create_agent
+
+agent = create_agent(
+    "gpt-5",
+    tools=tools
+)
+
+# 为了更好地控制模型配置，可以直接使用提供程序包初始化模型实例。
+  from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(
+    model="gpt-5-mini",
+    temperature=0.1,  # 温度是控制模型的随机性的
+    max_tokens=1000, # 最大tokens长度
+    timeout=30  # 30s就timeout
+    # ... (other params)
+)
+agent = create_agent(model, tools=tools)
+
+
+## 动态模型调用
+  # 可以优化复杂路由 需要使用新的功能 middleware 中间键 
+  # @wrap_model_call 这个装饰器会在请求中修改模型
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
+
+
+basic_model = ChatOpenAI(model="gpt-4o-mini")
+advanced_model = ChatOpenAI(model="gpt-4o")
+
+@wrap_model_call
+def dynamic_model_selection(request: ModelRequest, handler) -> ModelResponse:
+    """Choose model based on conversation complexity."""
+    message_count = len(request.state["messages"])  # 查看请求长度，如果长度大于10，就用高级模型
+
+    if message_count > 10:
+        # Use an advanced model for longer conversations
+        model = advanced_model
+    else:
+        model = basic_model
+
+    return handler(request.override(model=model))
+
+agent = create_agent(
+    model=basic_model,  # Default model
+    tools=tools,
+    middleware=[dynamic_model_selection] # 这里是定义middleware
+)
+
+
+
+
+## 工具
+  #工具可以指定为纯 Python 函数或协程。
+  #工具装饰器可用于自定义工具名称、描述、参数模式和其他属性。
+from langchain.tools import tool
+from langchain.agents import create_agent
+
+
+@tool
+def search(query: str) -> str:
+    """Search for information."""
+    return f"Results for: {query}"   # 这里是返回 ‘query’的回答
+
+@tool
+def get_weather(location: str) -> str:
+    """Get weather information for a location."""
+    return f"Weather in {location}: Sunny, 72°F" # 这里是填入咯action，得到location的天气
+
+agent = create_agent(model, tools=[search, get_weather]) # 定义在agent里
+
+
+## 工具里的错误error报告
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_tool_call
+from langchain.messages import ToolMessage
+
+
+@wrap_tool_call
+def handle_tool_errors(request, handler):  # 这里的逻辑也是tryexcept 的逻辑
+    """Handle tool execution errors with custom messages."""
+    try:
+        return handler(request)
+    except Exception as e:
+        # Return a custom error message to the model
+        return ToolMessage(
+            content=f"Tool error: Please check your input and try again. ({str(e)})",
+            tool_call_id=request.tool_call["id"]
+        )
+
+agent = create_agent(
+    model="gpt-4o",
+    tools=[search, get_weather],
+    middleware=[handle_tool_errors]
+)
+
+
+  ### 动态系统提示：对于需要根据运行时上下文或代理状态修改系统提示的更高级用例，可以使用中间件。
+  
+  from typing import TypedDict    # 这个是定义格式用的
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import dynamic_prompt, ModelRequest
+
+
+class Context(TypedDict): 
+    user_role: str
+
+@dynamic_prompt  # 
+def user_role_prompt(request: ModelRequest) -> str:
+    """Generate system prompt based on user role."""
+    user_role = request.runtime.context.get("user_role", "user")
+    base_prompt = "You are a helpful assistant."
+
+    if user_role == "expert":
+        return f"{base_prompt} Provide detailed technical responses."
+    elif user_role == "beginner":
+        return f"{base_prompt} Explain concepts simply and avoid jargon."
+
+    return base_prompt
+
+agent = create_agent(
+    model="gpt-4o",
+    tools=[web_search],user_role_prompt
+    middleware=[user_role_prompt],   # 中间件会把它得到的modelrequest直接使用user_role_prompt。
+    context_schema=Context
+)
+
+# The system prompt will be set dynamically based on context
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Explain machine learning"}]},
+    context={"user_role": "expert"}
+)
+
+  
+
+### 结构化输出
+  from pydantic import BaseModel
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+
+
+class ContactInfo(BaseModel):  #定义格式
+    name: str
+    email: str
+    phone: str
+
+agent = create_agent(
+    model="gpt-4o-mini",
+    tools=[search_tool],  
+    response_format=ToolStrategy(ContactInfo)
+)
+
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Extract contact info from: John Doe, john@example.com, (555) 123-4567"}]
+})
+
+result["structured_response"]
+
+# ContactInfo(name='John Doe', email='john@example.com', phone='(555) 123-4567')  #结果和定义好的格式是一样的
+
+
+## 还有一种叫提供者策略
+from langchain.agents.structured_output import ProviderStrategy
+
+agent = create_agent(
+    model="gpt-4o",
+    response_format=ProviderStrategy(ContactInfo)
+)  # 使用模型厂商的格式返回结果
+
+
+### 记忆
+
+  存储在状态中的信息可以被视为智能体的短期记忆：
+自定义状态模式必须扩展AgentState为TypedDict。
+定义自定义状态有两种方法：
+1 通过中间件（首选）
+2 通过state_schema​create_agent
+
+1 通过中间件
+from langchain.agents import AgentState
+from langchain.agents.middleware import AgentMiddleware
+from typing import Any
+
+
+class CustomState(AgentState):
+    user_preferences: dict
+
+class CustomMiddleware(AgentMiddleware):
+    state_schema = CustomState
+    tools = [tool1, tool2]
+
+    def before_model(self, state: CustomState, runtime) -> dict[str, Any] | None:
+        ...
+
+agent = create_agent(
+    model,
+    tools=tools,
+    middleware=[CustomMiddleware()]
+)
+
+# The agent can now track additional state beyond messages
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "I prefer technical explanations"}],
+    "user_preferences": {"style": "technical", "verbosity": "detailed"},
+})
+
+  
+# 直接定义schema
+
+  class CustomState(AgentState):
+    user_preferences: dict
+
+agent = create_agent(
+    model,
+    tools=[tool1, tool2],
+    state_schema=CustomState
+)
+# The agent can now track additional state beyond messages
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "I prefer technical explanations"}],
+    "user_preferences": {"style": "technical", "verbosity": "detailed"},
+})
+
+
+###流式输出：
+
+for chunk in agent.stream({
+    "messages": [{"role": "user", "content": "Search for AI news and summarize the findings"}]
+}, stream_mode="values"):
+    # Each chunk contains the full state at that point
+    latest_message = chunk["messages"][-1]
+    if latest_message.content:
+        print(f"Agent: {latest_message.content}")
+    elif latest_message.tool_calls:
+        print(f"Calling tools: {[tc['name'] for tc in latest_message.tool_calls]}")
+
+如果代理程序执行多个步骤，这可能需要一些时间。为了显示中间进度，我们可以实时回传消息。
+
+### 中间件
+
+中间件提供了强大的扩展性，可用于在执行的不同阶段自定义代理行为。可以使用中间件来：
+1 在调用模型之前处理状态（例如，消息修剪、上下文注入）
+  class ContextMiddleware(AgentMiddleware): #before_model
+    def before_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+        # --- 场景：上下文注入 ---
+        # 假设 state 里没有 user_id，我们强行塞一个进去（或者从 runtime 获取）
+        # 这对后续工具调用很有用
+         user_id = runtime.config.get("configurable", {}).get("user_id")
+        return {"user_id": "user_12345", "current_time": "2023-10-27"}
+
+
+  
+2 修改或验证模型的响应（例如，防护措施、内容过滤）#after_model
+class GuardrailMiddleware(AgentMiddleware):
+    def after_model(self, state: Any, result: Any, runtime: Any) -> Any:
+        # --- 场景：内容过滤 ---
+        if "杀人" in result.content:
+            # 直接覆写回复内容
+            result.content = "对不起，我不能回答这个问题。"
+        return result
+
+
+  
+3 使用自定义逻辑处理工具执行错误
+
+class ToolErrorMiddleware(AgentMiddleware): #after_tools
+    # 注意：具体接口名需确认版本，假设为 after_tools
+    def after_tools(self, state: Any, tool_outputs: List[Any], runtime: Any) -> Optional[Dict[str, Any]]:
+        # --- 场景：错误处理 ---
+        for output in tool_outputs:
+            # 假设工具返回了 Error 对象
+            if isinstance(output, Exception):
+                # 不要让 Agent 崩溃，而是把错误转成一段话告诉 LLM
+                # 这样 LLM 下一轮就能看到："Error: timeout"，然后尝试重试
+                return {"messages": [f"Tool execution failed: {str(output)}"]} 
+        return None
+
+  
+4 基于状态或上下文实现动态模型选择
+
+  class ModelRouterMiddleware(AgentMiddleware):
+    def before_model(self, state: Any, runtime: Any) -> None:
+        # --- 场景：动态模型选择 ---
+        # 检查用户是否是 VIP
+        is_vip = state.get("user_is_vip", False)
+        
+        if is_vip:
+            # 动态切换到底层模型配置
+            # 注意：这依赖于 runtime 暴露了 model 属性可写
+            runtime.model = "gpt-4" 
+        else:
+            runtime.model = "gpt-3.5-turbo"
+            
+        # 这里返回 None，因为我们改的是 runtime 配置，不是 state 数据
+        return None
+
+5 添加自定义日志记录、监控或分析功能
+
+  import time
+
+class LoggingMiddleware(AgentMiddleware):
+    def before_model(self, state: Any, runtime: Any) -> None:
+        # --- 场景：开始计时 ---
+        self.start_time = time.time()
+        print(f"Starting request for session {state.get('thread_id')}")
+
+    def after_model(self, state: Any, result: Any, runtime: Any) -> Any:
+        # --- 场景：计算耗时并上报 ---
+        duration = time.time() - self.start_time
+        print(f"Model call took {duration:.2f} seconds")
+        # 这里可以调用 requests.post("http://monitor-service", json=...)
+        return result
+
+中间件可以无缝集成到代理的执行过程中，允许您在关键点拦截和修改数据流，而无需更改核心代理逻辑​​。
