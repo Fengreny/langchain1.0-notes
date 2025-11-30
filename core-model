@@ -1,3 +1,206 @@
 ### model
 
 
+除了文本生成之外，许多模型还支持：
+ 工具调用- 调用外部工具（如数据库查询或 API 调用）并在其响应中使用结果。
+ 结构化输出——模型的响应被限制在定义的格式内。
+ 多模态——处理并返回除文本以外的数据，例如图像、音频和视频。
+ 推理——模型执行多步骤推理以得出结论。
+
+
+1. invoke
+response = model.invoke("Why do parrots have colorful feathers?")
+print(response)
+
+
+聊天模型可以接收消息列表来表示对话历史记录。每条消息都有一个角色，模型使用该角色来指示对话中消息的发送者。
+
+字典格式：
+conversation = [
+    {"role": "system", "content": "You are a helpful assistant that translates English to French."},
+    {"role": "user", "content": "Translate: I love programming."},
+    {"role": "assistant", "content": "J'adore la programmation."},
+    {"role": "user", "content": "Translate: I love building applications."}
+]
+
+response = model.invoke(conversation)
+print(response)  # AIMessage("J'adore créer des applications.")
+
+消息对象格式：
+from langchain.messages import HumanMessage, AIMessage, SystemMessage
+
+conversation = [
+    SystemMessage("You are a helpful assistant that translates English to French."),
+    HumanMessage("Translate: I love programming."),
+    AIMessage("J'adore la programmation."),
+    HumanMessage("Translate: I love building applications.")
+]
+
+response = model.invoke(conversation)
+print(response)  # AIMessage("J'adore créer des applications.")
+
+
+
+
+-----------------------------------------------------------------------------
+
+2. stream
+调用stream()返回一个迭代器它会在生成过程中实时输出数据块。
+full = None  # None | AIMessageChunk
+for chunk in model.stream("What color is the sky?"):
+    full = chunk if full is None else full + chunk
+    print(full.text)
+
+# The
+# The sky
+# The sky is
+# The sky is typically
+# The sky is typically blue
+# ...
+
+print(full.content_blocks)
+# [{"type": "text", "text": "The sky is typically blue..."}]
+
+
+-----------------------------------------------------------------------------
+
+
+3. batch
+将一系列独立的模型请求批量处理，可以显著提高性能并降低成本，因为可以并行处理这些请求：
+responses = model.batch([
+    "Why do parrots have colorful feathers?",
+    "How do airplanes fly?",
+    "What is quantum computing?"
+])
+for response in responses:
+    print(response)
+默认情况下batch会返回整个的结果，如果想要一个一个来用下面的：
+
+如果希望在每个输入生成完成后立即接收其输出，可以使用以下方式流式传输结果batch_as_completed()：
+for response in model.batch_as_completed([
+    "Why do parrots have colorful feathers?",
+    "How do airplanes fly?",
+    "What is quantum computing?"
+]):
+    print(response)
+
+
+
+
+
+
+parameters:
+
+model
+api_key
+temperature: 控制模型输出的随机性。数值越高，响应越具创造性；数值越低，响应越具确定性。
+max_tokens: 限制总数tokens在响应中，有效地控制输出的长度。
+timeout: 等待模型响应的最长时间（以秒为单位），超过此时间将取消请求。
+max_retries: 如果由于网络超时或速率限制等问题导致请求失败，系统将尝试重新发送请求的最大次数。
+
+
+可以使用init_chat_model初始化：
+model = init_chat_model(
+    "claude-sonnet-4-5-20250929",
+    # Kwargs passed to the model:
+    temperature=0.7,
+    timeout=30,
+    max_tokens=1000,
+)
+
+复习一下.env:
+# .env 文件内容
+
+# 1.  API 密钥 
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# 2. 你的 API 基础地址 (选填，默认是官方 api.openai.com)
+# 如果你用的是国内中转（比如 DeepSeek, Moonshot, 或者公司的私有部署），这里必须改
+OPENAI_API_BASE=https://api.deepseek.com/v1
+# 或者有些库叫这个名字：
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+
+# 3. 其他配置 (可选)
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=lsv2_xxxxxx
+LANGSMITH_API_KEY=XXXXXXXX
+
+py文件里：
+import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件里的环境变量到系统环境变量中
+load_dotenv() 
+
+# --- 测试一下 ---
+print(f"API Key loaded: {os.getenv('OPENAI_API_KEY')}")
+
+
+
+### 函数调用 tool calling 和structure output
+
+
+A. Tool Calling (工具调用)
+模型决定调用什么函数，你来执行，再把结果喂回给模型。
+
+定义工具： 使用 @tool 装饰器。
+绑定工具： 使用 bind_tools。
+执行循环： 模型返回 tool_call -> 执行代码 -> 返回结果 -> 模型生成最终答案。
+
+from langchain.tools import tool
+
+@tool
+def get_paper_info(arxiv_id: str) -> str:
+    """根据 Arxiv ID 获取论文摘要信息。"""
+    return f"论文 {arxiv_id} 是关于长上下文注意力机制的研究..."
+
+# 绑定工具
+model_with_tools = model.bind_tools([get_paper_info])
+
+# 调用
+response = model_with_tools.invoke("帮我查一下 arxiv:2305.1234 的内容")
+
+# 检查模型是否想调用工具
+if response.tool_calls:
+    print(f"模型想调用的工具: {response.tool_calls}")
+    # 输出示例: [{'name': 'get_paper_info', 'args': {'arxiv_id': '2305.1234'}, ...}]
+
+
+B. Structured Output (结构化输出)
+LangChain 支持直接绑定 Pydantic 模型或 TypedDict 来强制输出格式。
+
+from pydantic import BaseModel, Field
+
+# 定义你想要的数据结构
+class PaperReview(BaseModel):
+    title: str = Field(..., description="论文标题")
+    score: int = Field(..., description="评分 1-10")
+    summary: str = Field(..., description="一句话总结")
+
+# 强制模型输出这种结构
+structured_llm = model.with_structured_output(PaperReview)
+
+result = structured_llm.invoke("评价一下 Attention is All You Need 这篇论文")
+# result 现在直接是一个 PaperReview 对象，而不是字符串
+print(f"Title: {result.title}, Score: {result.score}")
+
+
+--------------------------------------------------------------------------
+对tokens 的统计
+
+from langchain_core.callbacks import get_usage_metadata_callback
+
+with get_usage_metadata_callback() as cb:
+    model.invoke("Hello")
+    print(cb.usage_metadata) 
+    # 输出: {'input_tokens': 8, 'output_tokens': 10, ...}
+
+Configurable Models (运行时配置):
+这是 LangChain 的一大亮点。写一套逻辑，但在运行时通过 config 字典切换模型（例如：开发时用 gpt-4o-mini 省钱，上线用 gpt-4o）。
+configurable_model = init_chat_model(temperature=0)
+
+# 运行时指定模型
+configurable_model.invoke(
+    "你好", 
+    config={"configurable": {"model": "gpt-4o"}}
+)
+
