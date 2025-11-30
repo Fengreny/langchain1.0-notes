@@ -1,0 +1,40 @@
+## messages
+
+消息对构建多智能体mutliagent 和上下文比较重要 
+
+1. 基础骨架：四大消息类型
+LangChain 将所有对话交互标准化为对象，这比直接处理原始 API 的 JSON 字典（虽然也支持）要稳健得多。
+
+最常用的四个类：
+
+SystemMessage: 设定 AI 的人设、语气和规则。
+HumanMessage: 用户的输入（文本、图片、文件等）。
+AIMessage: 模型的输出（包含文本、工具调用请求、Token 统计）。
+ToolMessage: 工具执行后的结果回传。
+
+
+from langchain.chat_models import init_chat_model
+from langchain.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
+# 初始化模型
+model = init_chat_model("gpt-4o")
+
+# 1. 构建对话历史
+messages = [
+    # 设定人设
+    SystemMessage("你是一个专注于大模型理论的科研助手。"),
+    
+    # 用户提问
+    HumanMessage("什么是 Attention 机制？"),
+    
+    # (可选) 手动插入 AI 的回复，用于 Few-shot learning 或恢复历史
+    AIMessage("Attention 机制是 Transformer 的核心组件..."),
+    
+    # 用户追问
+    HumanMessage("那 Self-Attention 呢？")
+]
+
+# 2. 调用模型
+response = model.invoke(messages)
+print(type(response)) # <class 'langchain.messages.AIMessage'>
+
